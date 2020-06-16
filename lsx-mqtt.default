@@ -1,0 +1,37 @@
+##
+## MQTT Server Information
+##
+
+# The host name or IP address of your MQTT server.  Note that this code always
+# connects over SSL using port 8883 and requires a valid SSL certificate.
+LSX_MQTT_HOST="mqtt.mydomain.com"
+
+# Login credentials for the MQTT server
+LSX_MQTT_USERNAME="kef-lsx"
+LSX_MQTT_PASSWORD="mqtt-password-goes-here"
+
+# The root topic.  This should only need to be changed if you're running more
+# than one home automation system on the MQTT server.
+LSX_MQTT_ROOT="homie"
+
+# The device name.  If you have more than one set of LSX speakers, change this
+# so that each set has a unique name.
+LSX_MQTT_DEVICE="lsx"
+
+
+##
+## LSX Speaker Information
+##
+
+# The host name or IP address of your KEF LSX speakers.
+LSX_SPEAKER_IP="192.168.0.101"
+
+# How long to wait (in seconds) after sending a command before assuming the
+# connection has been lost.
+LSX_SPEAKER_TIMEOUT="5"
+
+# How frequently (in seconds) the script should ask the speakers for their
+# current status.  This only matters when the speakers are also being managed
+# using a remote control or phone app in addition to the home automation system.
+# Changes made via MQTT will be reflected immediately.
+LSX_SPEAKER_POLL_FREQUENCY="30"

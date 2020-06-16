@@ -1,0 +1,280 @@
+#!/usr/bin/perl
+
+# Copyright 2020 Steve Simms
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+use strict;
+use warnings;
+
+my $host     = $ENV{'LSX_MQTT_HOST'} or die 'Unspecified LSX_MQTT_HOST';
+my $username = $ENV{'LSX_MQTT_USERNAME'} or die 'Unspecified LSX_MQTT_USERNAME';
+my $password = $ENV{'LSX_MQTT_PASSWORD'} or die 'Unspecified LSX_MQTT_PASSWORD';
+my $root     = $ENV{'LSX_MQTT_ROOT'} // 'homie';
+my $device   = $ENV{'LSX_MQTT_DEVICE'} // 'lsx';
+
+my $speaker_ip      = $ENV{'LSX_SPEAKER_IP'} or die 'Unspecified LSX_SPEAKER_IP';
+my $speaker_port    = $ENV{'LSX_SPEAKER_PORT'} // 50001;
+my $speaker_timeout = $ENV{'LSX_SPEAKER_TIMEOUT'} // 5;
+
+my $poll_frequency = $ENV{'LSX_SPEAKER_POLL_FREQUENCY'} // 30;
+
+use IO::Socket;
+use Net::MQTT::Simple::SSL;
+
+sub topic {
+    my $topic = shift();
+    return "$root/$device/$topic";
+}
+
+my $mqtt = Net::MQTT::Simple::SSL->new($host);
+$mqtt->login($username, $password);
+$mqtt->last_will(topic('$state'), 'lost', 1);
+
+$mqtt->retain(topic('$homie'), '4.0.0');
+$mqtt->retain(topic('$name'), 'KEF LSX Speaker');
+$mqtt->retain(topic('$nodes'), 'speaker');
+
+$mqtt->retain(topic('speaker/$name'), 'Speaker');
+$mqtt->retain(topic('speaker/$type'), 'Speaker');
+$mqtt->retain(topic('speaker/$properties'), 'mute,power,source,volume');
+
+$mqtt->retain(topic('speaker/mute/$name'), 'Mute');
+$mqtt->retain(topic('speaker/mute/$datatype'), 'boolean');
+$mqtt->retain(topic('speaker/mute/$settable'), 'true');
+
+$mqtt->retain(topic('speaker/power/$name'), 'Power');
+$mqtt->retain(topic('speaker/power/$datatype'), 'boolean');
+$mqtt->retain(topic('speaker/power/$settable'), 'true');
+
+$mqtt->retain(topic('speaker/source/$name'), 'Source');
+$mqtt->retain(topic('speaker/source/$datatype'), 'enum');
+$mqtt->retain(topic('speaker/source/$format'), 'Aux,Bluetooth,Optical,USB,Wifi');
+$mqtt->retain(topic('speaker/source/$settable'), 'true');
+
+$mqtt->retain(topic('speaker/volume/$name'), 'Volume');
+$mqtt->retain(topic('speaker/volume/$datatype'), 'integer');
+$mqtt->retain(topic('speaker/volume/$format'), '0:100');
+$mqtt->retain(topic('speaker/volume/$settable'), 'true');
+
+$mqtt->retain(topic('$state'), 'ready');
+
+sub _connect_speaker {
+    my $socket;
+    my $attempts = 0;
+    until ($socket) {
+        $socket = IO::Socket::INET->new(PeerAddr => $speaker_ip,
+                                        PeerPort => $speaker_port,
+                                        Proto => 'tcp',
+                                        Timeout => $speaker_timeout);
+        unless ($socket) {
+            $attempts++;
+            if ($attempts == 5) {
+                warn "Error connecting to speaker: $!";
+                last;
+            }
+            sleep 1;
+        }
+    }
+    return $socket;
+}
+
+my $last_mute;
+my $last_standby;
+my $last_source;
+my $last_volume;
+
+sub _poll_speaker {
+    my $socket = _connect_speaker();
+    return unless $socket;
+
+    my $data;
+    my $value;
+
+    # Volume
+    $socket->send("G%\x80");
+    $socket->recv($data, 5);
+    $value = ord(substr($data, 3, 1));
+
+    my $mute = $value >= 128;
+    $value %= 128;
+    my $volume = $value;
+
+    # Source
+    $socket->send('G0\x80');
+    $socket->recv($data, 5);
+    $value = ord(substr($data, 3, 1));
+
+    my $standby = $value >= 128;
+    $value %= 128;
+    my $lr_swap = $value >= 64;
+    $value %= 64;
+    my $timeout = $value >= 16 ? int($value / 16) : 0;
+    $value %= 16;
+    my $source = ($value == 10 ? 'Aux' :
+                  $value ==  9 ? 'Bluetooth' :
+                  $value == 15 ? 'Bluetooth' :
+                  $value == 11 ? 'Optical'   :
+                  $value == 12 ? 'USB'       :
+                  $value ==  2 ? 'Wifi'      : undef);
+
+    $socket->close();
+
+    unless (defined($last_mute) and $last_mute == $mute) {
+        $mqtt->retain(topic('speaker/mute'), $mute ? 'true' : 'false');
+        $last_mute = $mute;
+    }
+    unless (defined($last_standby) and $last_standby == $standby) {
+        $mqtt->retain(topic('speaker/power'), $standby ? 'false' : 'true');
+        $last_standby = $standby;
+    }
+    unless (defined($last_source) and $last_source eq $source) {
+        $mqtt->retain(topic('speaker/source'), $source);
+        $last_source = $source;
+    }
+    unless (defined($last_volume) and $last_volume == $volume) {
+        $mqtt->retain(topic('speaker/volume'), $volume);
+        $last_volume = $volume;
+    }
+}
+
+sub _tell_speaker {
+    my ($attribute, $value) = @_;
+    my $set = defined($value);
+
+    my $message = join('',
+                       ($set ? 'S' : 'G'),
+                       $attribute,
+                       ($set ? "\x81" : "\x80"),
+                       ($set ? pack('C', $value) : ()));
+
+    my $socket = _connect_speaker();
+    return unless $socket;
+
+    $socket->send($message)
+        or warn "Error sending message to speaker: $!";
+
+    my $result;
+    unless ($set) {
+        my $data;
+        $socket->read($data, 5)
+            or warn "Error reading response from speaker: $!";
+
+        if ($data and length($data) ==  5) {
+            $result = ord(substr($data, 3, 1));
+        }
+    }
+
+    $socket->close();
+    return $result;
+}
+
+sub _get_volume {
+    my $result = _tell_speaker('%');
+    return unless defined $result;
+
+    $result = $result % 128;
+    $mqtt->retain(topic('speaker/volume'), $result);
+    return $result;
+}
+
+sub _get_source {
+    my $result = _tell_speaker('0');
+    return unless defined $result;
+
+    $result = $result % 16;
+
+    return 'Aux'       if $result == 10;
+    return 'Bluetooth' if $result ==  9 or $result == 15;
+    return 'Optical'   if $result == 11;
+    return 'USB'       if $result == 12;
+    return 'Wifi'      if $result ==  2;
+    return;
+
+    $mqtt->retain(topic('speaker/volume'), $result);
+    return $result;
+}
+
+$mqtt->subscribe(topic('speaker/source/set') => sub {
+    my ($topic, $message) = @_;
+
+    my $source = ($message eq 'Aux'       ? 10 :
+                  $message eq 'Bluetooth' ?  9 :
+                  $message eq 'Optical'   ? 11 :
+                  $message eq 'USB'       ? 12 :
+                  $message eq 'Wifi'      ?  2 : 0);
+    return unless $source;
+
+    my $standby = $last_standby;
+    my $timeout = 2;
+    my $lr_swap = 0;
+
+    my $value = $source + 16 * $timeout + 64 * $lr_swap + 128 * $standby;
+
+    _tell_speaker('0', $value);
+    _get_source();
+});
+
+$mqtt->subscribe(topic('speaker/power/set') => sub {
+    my ($topic, $message) = @_;
+
+    return unless $message eq 'true' or $message eq 'false';
+
+    my $standby = $message eq 'true' ? 0 : 1;
+    my $timeout = 2;
+    my $lr_swap = 0;
+
+    my $source = ($last_source eq 'Aux'       ? 10 :
+                  $last_source eq 'Bluetooth' ?  9 :
+                  $last_source eq 'Optical'   ? 11 :
+                  $last_source eq 'USB'       ? 12 :
+                  $last_source eq 'Wifi'      ?  2 : 0);
+
+    my $value = $source + 16 * $timeout + 64 * $lr_swap + 128 * $standby;
+
+    _tell_speaker('0', $value);
+    _get_source();
+});
+
+$mqtt->subscribe(topic('speaker/mute/set') => sub {
+    my ($topic, $message) = @_;
+
+    return unless $message eq 'true' or $message eq 'false';
+
+    my $mute   = $message eq 'true' ? 1 : 0;
+    my $volume = $last_volume;
+
+    my $value = $volume + $mute * 128;
+
+    _tell_speaker('%', $value);
+    _get_volume();
+});
+
+$mqtt->subscribe(topic('speaker/volume/set') => sub {
+    my ($topic, $volume) = @_;
+
+    return unless $volume =~ /^\d+$/;
+    return unless $volume <= 100;
+
+    my $mute = $last_mute;
+
+    my $value = $volume + $mute * 128;
+
+    _tell_speaker('%', $value);
+    _get_volume();
+});
+
+while (1) {
+    _poll_speaker();
+    $mqtt->tick($poll_frequency);
+}
